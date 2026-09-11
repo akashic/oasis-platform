@@ -124,6 +124,32 @@ class TestAgentsCRUD:
         assert data["adaptive_policy"]["mode"] == "shadow"
         assert data["adaptive_policy"]["rules"][0]["action"] == "offer_break"
 
+    async def test_create_agent_accepts_match_style_action(
+        self, client: AsyncClient, study_id: str
+    ):
+        resp = await client.post(
+            f"/api/studies/{study_id}/agents",
+            json={
+                "name": "Style-Matching Agent",
+                "track_engagement": True,
+                "adaptive_enabled": True,
+                "adaptive_policy": {
+                    "mode": "shadow",
+                    "rules": [
+                        {
+                            "on": "positive_engagement_streak",
+                            "action": "match_style",
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 201
+        rule = resp.json()["adaptive_policy"]["rules"][0]
+        assert rule["on"] == "positive_engagement_streak"
+        assert rule["action"] == "match_style"
+
     async def test_invalid_adaptive_action_fails(self, client: AsyncClient, study_id: str):
         resp = await client.post(
             f"/api/studies/{study_id}/agents",
