@@ -94,6 +94,7 @@ ADAPTIVE_ACTIONS = (
     "encourage_elaboration",
     "acknowledge_effort",
     "privacy_check",
+    "match_style",
     "slow_down",
     "reset_pace",
 )

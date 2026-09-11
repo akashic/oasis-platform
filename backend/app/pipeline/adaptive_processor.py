@@ -23,7 +23,6 @@ from loguru import logger
 from pipecat.frames.frames import (
     Frame,
     LLMMessagesAppendFrame,
-    TranscriptionFrame,
     TTSUpdateSettingsFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -106,12 +105,12 @@ class AdaptiveBehaviorProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         to_record: list[tuple] = []
-        # Act only when the engagement processor has finalized a new complete
-        # turn; intermediate STT fragments pass through untouched.
-        if (
-            isinstance(frame, TranscriptionFrame)
-            and self._signals.turn_id != self._last_turn_id
-        ):
+        # EngagementProcessor increments turn_id immediately before forwarding
+        # whichever frame completes the turn. Depending on turn-analyzer/STT
+        # ordering, that frame can be UserStoppedSpeakingFrame or
+        # TranscriptionFrame, so key only on the finalized-turn counter.
+        # Intermediate STT fragments do not increment it.
+        if self._signals.turn_id != self._last_turn_id:
             self._last_turn_id = self._signals.turn_id
             try:
                 to_record = await self._maybe_adapt()
