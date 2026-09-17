@@ -11,18 +11,42 @@ POST /api/settings/smoke-test   Verify configured providers
 """
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from loguru import logger
 
+from app.auth import require_auth
 from app.config import settings
+from app.crypto import decrypt_secret, encrypt_secret
+from app.egress_guard import EgressURLError, validate_egress_url
 from app.providers.catalog import get_configured_catalog
 from app.providers.smoke import run_configured_smoke_tests
 from app.redis import get_redis
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
+
+# FINDING-007: URL-valued fields within `_API_KEY_FIELDS` — these are
+# destinations the backend makes outbound requests to, not secrets, so they
+# get SSRF validation (`validate_egress_url`) instead of/in addition to
+# masking, and a required confirmation + audit trail when changed.
+_URL_FIELDS = {
+    "openai_compatible_llm_url",
+    "azure_openai_endpoint",
+    "self_hosted_stt_url",
+    "self_hosted_tts_url",
+    "embedding_api_url",
+}
+
+
+def _actor(payload: dict | None) -> str:
+    """Best-effort identity for audit log lines. `require_auth` returns
+    `None` when AUTH_ENABLED=false (see app/auth.py)."""
+    if payload:
+        return str(payload.get("sub") or "unknown")
+    return "unauthenticated"
 
 # Redis key for API key overrides
 _REDIS_KEY = "oasis:settings:api_keys"
@@ -126,6 +150,12 @@ class ApiKeyUpdate(BaseModel):
     twilio_auth_token: Optional[str] = None
     twilio_phone_number: Optional[str] = None
 
+    # FINDING-007: changing a *URL* field (see `_URL_FIELDS`) to a new,
+    # non-empty value requires this to be explicitly `true`. Prevents a
+    # single unreviewed write from silently redirecting participant
+    # audio/transcripts or an operator's provider spend to another host.
+    confirm_endpoint_change: bool = False
+
 
 class AuthConfigResponse(BaseModel):
     auth_enabled: bool
@@ -140,14 +170,18 @@ async def get_effective_key(field: str) -> str:
     redis = await get_redis()
     override = await redis.hget(_REDIS_KEY, field)
     if override:
-        return override
+        # FINDING-006: values are stored encrypted (see `update_api_keys`).
+        # `decrypt_secret` transparently returns pre-existing plaintext
+        # values unchanged, so upgrading does not break existing overrides.
+        return decrypt_secret(override)
     return getattr(settings, field, "")
 
 
 async def _get_all_overrides() -> dict[str, str]:
-    """Get all Redis-stored API key overrides."""
+    """Get all Redis-stored API key overrides, decrypted (FINDING-006)."""
     redis = await get_redis()
-    return await redis.hgetall(_REDIS_KEY)
+    raw = await redis.hgetall(_REDIS_KEY)
+    return {field: decrypt_secret(value) for field, value in raw.items()}
 
 
 @router.get("/keys", response_model=ApiKeysResponse)
@@ -184,25 +218,59 @@ async def list_api_keys():
 
 
 @router.put("/keys", response_model=ApiKeysResponse)
-async def update_api_keys(data: ApiKeyUpdate):
+async def update_api_keys(
+    data: ApiKeyUpdate, payload: dict | None = Depends(require_auth)
+):
     """
-    Update API key overrides. These are stored in Redis and take
-    priority over .env values. Send an empty string to clear an override.
+    Update API key overrides. These are stored in Redis (encrypted,
+    FINDING-006) and take priority over .env values. Send an empty string
+    to clear an override.
+
+    FINDING-007: URL-valued fields (`_URL_FIELDS`) are SSRF-validated and
+    require `confirm_endpoint_change: true` to change to a new value.
     """
     redis = await get_redis()
-    updates = data.model_dump(exclude_none=True)
+    updates = data.model_dump(exclude={"confirm_endpoint_change"}, exclude_none=True)
+    actor = _actor(payload)
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     for field, value in updates.items():
         if field not in _API_KEY_FIELDS:
             continue
 
+        if field in _URL_FIELDS and value:
+            try:
+                validate_egress_url(value, field=field)
+            except EgressURLError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+
+            old_value = await get_effective_key(field)
+            if value != old_value and not data.confirm_endpoint_change:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Changing {field} to a new value requires "
+                        "confirm_endpoint_change: true. This changes where "
+                        "participant audio/transcripts and API keys are sent."
+                    ),
+                )
+
         if value == "":
             # Clear the override — fall back to .env
             await redis.hdel(_REDIS_KEY, field)
-            logger.info(f"Cleared API key override: {field}")
+            logger.info(f"Settings audit: actor={actor} action=clear field={field} at={timestamp}")
         else:
-            await redis.hset(_REDIS_KEY, field, value)
-            logger.info(f"Set API key override: {field}")
+            if field in _URL_FIELDS:
+                # URLs are not secrets — log old/new for the audit trail
+                # required by FINDING-007 (rec. 3).
+                logger.info(
+                    f"Settings audit: actor={actor} action=set field={field} "
+                    f"old={old_value!r} new={value!r} at={timestamp}"
+                )
+                await redis.hset(_REDIS_KEY, field, value)
+            else:
+                await redis.hset(_REDIS_KEY, field, encrypt_secret(value))
+                logger.info(f"Settings audit: actor={actor} action=set field={field} at={timestamp}")
 
     # Return updated status
     return await list_api_keys()
@@ -329,6 +397,13 @@ class AudioStorageUpdate(BaseModel):
     audio_s3_access_key_id: Optional[str] = None
     audio_s3_secret_access_key: Optional[str] = None
 
+    # FINDING-007 (Revision 4 residual): `audio_s3_endpoint_url` carries
+    # participant audio and S3 credentials to whatever host it names
+    # (`audio/storage.py`'s boto3 client) but, unlike the five fields in
+    # `_URL_FIELDS` above, was never SSRF-validated or confirmation-gated.
+    # Same treatment as `ApiKeyUpdate.confirm_endpoint_change`.
+    confirm_endpoint_change: bool = False
+
 
 async def get_effective_audio_setting(field: str) -> str:
     """Dashboard override (Redis) > .env value for audio storage fields."""
@@ -337,7 +412,9 @@ async def get_effective_audio_setting(field: str) -> str:
     redis = await get_redis()
     override = await redis.hget(_AUDIO_STORAGE_REDIS_KEY, field)
     if override is not None and override != "":
-        return override
+        # FINDING-006: sensitive fields (S3 keys) are stored encrypted.
+        _, sensitive = _AUDIO_STORAGE_FIELDS[field]
+        return decrypt_secret(override) if sensitive else override
     return str(getattr(settings, field, "") or "")
 
 
@@ -364,6 +441,8 @@ async def list_audio_storage_settings():
     for field, (env_var, sensitive) in _AUDIO_STORAGE_FIELDS.items():
         env_value = str(getattr(settings, field, "") or "")
         override_value = overrides.get(field, "")
+        if override_value and sensitive:
+            override_value = decrypt_secret(override_value)
 
         if override_value:
             source = "dashboard"
@@ -390,10 +469,21 @@ async def list_audio_storage_settings():
 
 
 @router.put("/audio-storage", response_model=AudioStorageResponse)
-async def update_audio_storage_settings(data: AudioStorageUpdate):
-    """Update audio storage overrides. Empty string clears an override."""
+async def update_audio_storage_settings(
+    data: AudioStorageUpdate, payload: dict | None = Depends(require_auth)
+):
+    """Update audio storage overrides. Empty string clears an override.
+
+    FINDING-007: `audio_s3_endpoint_url` is SSRF-validated and requires
+    `confirm_endpoint_change: true` to change to a new value, the same
+    treatment `PUT /api/settings/keys` already gives the five provider URL
+    fields — it carries participant audio and S3 credentials to whatever
+    host it names.
+    """
     redis = await get_redis()
-    updates = data.model_dump(exclude_none=True)
+    updates = data.model_dump(exclude={"confirm_endpoint_change"}, exclude_none=True)
+    actor = _actor(payload)
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     for field, value in updates.items():
         if field not in _AUDIO_STORAGE_FIELDS:
@@ -408,12 +498,34 @@ async def update_audio_storage_settings(data: AudioStorageUpdate):
                 )
             value = normalized
 
+        if field == "audio_s3_endpoint_url" and value:
+            try:
+                validate_egress_url(value, field=field)
+            except EgressURLError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+
+            old_value = await get_effective_audio_setting(field)
+            if value != old_value and not data.confirm_endpoint_change:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Changing {field} to a new value requires "
+                        "confirm_endpoint_change: true. This changes where "
+                        "recorded participant audio and S3 credentials are sent."
+                    ),
+                )
+
+        _, sensitive = _AUDIO_STORAGE_FIELDS[field]
+
         if value == "":
             await redis.hdel(_AUDIO_STORAGE_REDIS_KEY, field)
-            logger.info(f"Cleared audio storage override: {field}")
+            logger.info(f"Settings audit: actor={actor} action=clear field={field} at={timestamp}")
         else:
-            await redis.hset(_AUDIO_STORAGE_REDIS_KEY, field, value)
-            logger.info(f"Set audio storage override: {field}")
+            # FINDING-006: encrypt sensitive fields (S3 access/secret keys)
+            # before they ever reach Redis.
+            stored_value = encrypt_secret(value) if sensitive else value
+            await redis.hset(_AUDIO_STORAGE_REDIS_KEY, field, stored_value)
+            logger.info(f"Settings audit: actor={actor} action=set field={field} at={timestamp}")
 
     return await list_audio_storage_settings()
 

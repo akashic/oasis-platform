@@ -1,0 +1,45 @@
+# OASIS reverse proxy — plaintext local-development variant.
+#
+# FINDING-010: the default docker/Caddyfile now requires DOMAIN to be set
+# and serves TLS-only (even for DOMAIN=localhost, via Caddy's internal CA).
+# This file is the explicit, non-default opt-out for local development that
+# needs plain, uncertified HTTP on :80 — e.g. scripted tests or tooling that
+# does not handle TLS. It is never used automatically: to opt in, set
+#   CADDY_CONFIG_FILE=./docker/Caddyfile.dev
+# in your local .env before running `docker compose up`.
+#
+# Do not use this file for any deployment reachable from an untrusted
+# network — it carries admin credentials, JWTs and participant transcripts
+# in cleartext.
+:80 {
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "microphone=(self)"
+	}
+
+	handle /api/* {
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy backend:8000 {
+			# FINDING-015: see docker/Caddyfile — overwrite X-Forwarded-For
+			# with Caddy's own observed peer rather than trusting/forwarding
+			# any client-supplied value.
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+
+	handle /ws/* {
+		reverse_proxy backend:8000 {
+			transport http {
+				keepalive 30s
+			}
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+
+	handle {
+		reverse_proxy frontend:80
+	}
+}

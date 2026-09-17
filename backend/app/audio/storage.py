@@ -14,6 +14,7 @@ from uuid import UUID
 from loguru import logger
 
 from app.config import settings
+from app.egress_guard import EgressURLError, validate_egress_url
 
 _SAFE_SEGMENT = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -200,13 +201,24 @@ async def get_audio_storage() -> Optional[AudioStorageBackend]:
         if not bucket:
             logger.warning("AUDIO_STORAGE_BACKEND=s3 but AUDIO_S3_BUCKET is empty")
             return None
+        endpoint_url = cfg.get("audio_s3_endpoint_url") or ""
+        if endpoint_url:
+            # FINDING-007: re-validate immediately before use (not only at
+            # write time in api/settings.py) to defeat DNS rebinding between
+            # the two checks — this endpoint receives every recorded
+            # participant audio file and the S3 credentials above.
+            try:
+                validate_egress_url(endpoint_url, field="audio_s3_endpoint_url")
+            except EgressURLError as exc:
+                logger.error(f"Refusing to use AUDIO_S3_ENDPOINT_URL: {exc}")
+                return None
         return S3AudioStorage(
             bucket=bucket,
             prefix=cfg.get("audio_s3_prefix") or "oasis-recordings",
             region=cfg.get("audio_s3_region") or "us-east-1",
             access_key_id=cfg.get("audio_s3_access_key_id") or "",
             secret_access_key=cfg.get("audio_s3_secret_access_key") or "",
-            endpoint_url=cfg.get("audio_s3_endpoint_url") or "",
+            endpoint_url=endpoint_url,
         )
 
     local_path = cfg.get("audio_storage_local_path") or "/data/oasis-recordings"

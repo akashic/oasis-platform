@@ -1,11 +1,51 @@
-# For local development, listen on :80 without TLS.
-# For production, replace ':80' with your domain (e.g. survey.example.com)
-# and Caddy will auto-provision SSL certificates.
+# OASIS reverse proxy.
+#
+# FINDING-010: the site address is driven by the DOMAIN environment variable
+# (see .env / .env.example) instead of a bare ":80" — Caddy refuses to start
+# if DOMAIN is unset or empty, so a deployment can no longer silently fall
+# back to unencrypted, uncertified plaintext HTTP. Caddy's automatic HTTPS
+# then applies to whatever DOMAIN resolves to:
+#   - A real internet-facing domain gets a Let's Encrypt certificate and an
+#     automatic HTTP→HTTPS redirect on :80 (the production path).
+#   - DOMAIN=localhost (the .env.example default) gets a certificate from
+#     Caddy's internal CA — browsers will show a certificate warning on
+#     first load, which is expected for local development. Click through it,
+#     or import Caddy's local root CA (see docs/DEPLOYMENT.md).
+#
+# For a fully plaintext local-only setup with no TLS at all (e.g. scripted
+# integration tests that talk to plain :80), use docker/Caddyfile.dev
+# instead — set CADDY_CONFIG_FILE=./docker/Caddyfile.dev in your local .env.
+# It is intentionally not the default.
+{$DOMAIN} {
+	# ── Security headers (FINDING-010), applied to every response ──
+	# Content-Security-Policy is set per-route below because the interview
+	# widget (/interview/*) is designed to be embedded via <iframe> on
+	# third-party survey tools and must not carry frame-ancestors 'none'.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "microphone=(self)"
+	}
 
-:80 {
-	# ── API & WebSocket traffic → Backend ──
+	# ── API traffic → Backend ──
 	handle /api/* {
-		reverse_proxy backend:8000
+		header Content-Security-Policy "default-src 'self'; frame-ancestors 'none'"
+		# FINDING-009: reject oversized request bodies at the proxy as
+		# defence in depth, ahead of the backend's own streaming size check.
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy backend:8000 {
+			# FINDING-015: overwrite (not append to) X-Forwarded-For with
+			# only the address Caddy itself observed, discarding any value
+			# an external client sent. The backend's ProxyHeadersMiddleware
+			# only trusts this header from Caddy's own address in the first
+			# place (TRUSTED_PROXY_IPS), but stripping the inbound copy here
+			# too means there is never more than one, trustworthy value to
+			# parse — belt and braces against a malformed/multi-value header.
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
 	}
 
 	# ── WebSocket upgrade for audio/chat streams ──
@@ -14,11 +54,22 @@
 			transport http {
 				keepalive 30s
 			}
+			# FINDING-015: see the /api/* block above — same rationale
+			# applies to the Twilio media-stream and monitor WebSockets.
+			header_up X-Forwarded-For {http.request.remote.host}
 		}
 	}
 
-	# ── Everything else → Frontend ──
+	# ── Participant interview widget — embeddable by design, no
+	#    frame-ancestors restriction ──
+	handle /interview/* {
+		header Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+		reverse_proxy frontend:80
+	}
+
+	# ── Everything else (admin dashboard) → Frontend, framing forbidden ──
 	handle {
+		header Content-Security-Policy "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'"
 		reverse_proxy frontend:80
 	}
 }

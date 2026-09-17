@@ -16,29 +16,117 @@ Setup:
   1. Configure your Twilio phone number's Voice webhook to point to:
        https://your-domain.com/api/twilio/voice/{agent_id}
   2. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN in your .env
+
+FINDING-003 remediation: the webhook validates Twilio's ``X-Twilio-Signature``
+before doing anything else, and the returned ``<Stream>`` URL is built from
+the trusted, operator-configured ``DOMAIN`` setting rather than the
+inbound (attacker-controllable) ``Host`` header. The webhook also mints a
+short-lived, single-use signed "stream ticket" and passes it to the media
+stream as a ``<Parameter>``; the WebSocket endpoint verifies it before
+creating any Session row or booting the pipeline.
 """
 
 import asyncio
 import json
 import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
+import jwt
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from loguru import logger
 from sqlalchemy import select
+from twilio.request_validator import RequestValidator
 
 from app.config import settings
 from app.database import async_session_factory
 from app.models.agent import Agent, AgentStatus, ParticipantIdMode
 from app.models.session import Session, SessionStatus, aggregate_session_tokens
 from app.providers.validate import validate_agent_pipeline_config
+from app.rate_limit import check_fixed_window
 from app.realtime import publish_transcript_event
 
 router = APIRouter()
 
 # Maximum pipeline runtime (seconds)
 _MAX_PIPELINE_SECONDS = 7200
+
+# FINDING-005 (Revision 2): no limiter of any kind previously existed on
+# either the voice webhook or the media-stream WebSocket. Limits are
+# generous — Twilio's own signature/ticket checks are the real defense —
+# these exist to cap the resource cost (connection slots, log volume,
+# DB writes) of a flood from a single source.
+_WEBHOOK_RATE_LIMIT = (60, 60)  # 60 requests / 60s per source IP
+_WS_RATE_LIMIT = (30, 60)  # 30 connection attempts / 60s per source IP
+
+# Stream ticket signing (FINDING-003) — short-lived, single-purpose JWT
+# minted by the (now signature-verified) voice webhook and checked by the
+# media-stream WebSocket before it creates a Session or boots a pipeline.
+_STREAM_TICKET_TTL_SECONDS = 60
+_STREAM_TICKET_ALGORITHM = "HS256"
+_STREAM_TICKET_PURPOSE = "twilio_stream"
+
+_LOCAL_HOSTS = ("localhost", "127.0.0.1")
+
+
+def _public_webhook_url(request: Request) -> str:
+    """Reconstruct the exact public URL Twilio signed.
+
+    Uses the operator-configured ``DOMAIN`` setting rather than the inbound
+    ``Host`` header, which is attacker-controllable and previously drove
+    both the returned ``<Stream>`` URL and (if used here) signature
+    validation itself.
+    """
+    scheme = "http" if settings.domain in _LOCAL_HOSTS else "https"
+    return f"{scheme}://{settings.domain}{request.url.path}"
+
+
+def _validate_twilio_signature(request: Request, form) -> bool:
+    """Validate ``X-Twilio-Signature`` against the trusted webhook URL.
+
+    Fails closed: returns False (never raises) when TWILIO_AUTH_TOKEN is
+    unset, the header is missing, or the signature does not match.
+    """
+    if not settings.twilio_auth_token:
+        logger.error("Twilio webhook rejected: TWILIO_AUTH_TOKEN is not configured")
+        return False
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+
+    validator = RequestValidator(settings.twilio_auth_token)
+    return validator.validate(_public_webhook_url(request), form, signature)
+
+
+def _create_stream_ticket(agent_id: str) -> str:
+    """Mint a short-lived, single-purpose ticket authorizing exactly one
+    media-stream connection for ``agent_id``."""
+    payload = {
+        "agent_id": agent_id,
+        "purpose": _STREAM_TICKET_PURPOSE,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + _STREAM_TICKET_TTL_SECONDS,
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm=_STREAM_TICKET_ALGORITHM)
+
+
+def _verify_stream_ticket(ticket: str | None, agent_id: str) -> bool:
+    """Verify a stream ticket was issued for this exact ``agent_id`` and
+    has not expired or been tampered with."""
+    if not ticket:
+        return False
+    try:
+        payload = jwt.decode(
+            ticket, settings.secret_key, algorithms=[_STREAM_TICKET_ALGORITHM]
+        )
+    except jwt.InvalidTokenError:
+        return False
+    return (
+        payload.get("purpose") == _STREAM_TICKET_PURPOSE
+        and payload.get("agent_id") == agent_id
+    )
 
 
 def _normalize_e164(value: str | None) -> str:
@@ -115,13 +203,39 @@ async def twilio_voice_webhook(agent_id: str, request: Request):
     Returns TwiML XML instructing Twilio to connect the call to
     our WebSocket endpoint via Media Streams.
     """
-    # Twilio posts the called number as the ``To`` form field. We use this
-    # to route to the right agent when several share the same webhook URL.
+    # FINDING-005: rate limit by source IP before doing any work at all
+    # (signature validation still runs afterwards and is the real gate).
+    client_ip = request.client.host if request.client else "unknown"
+    limit, window = _WEBHOOK_RATE_LIMIT
+    allowed, retry_after = await check_fixed_window(
+        f"twilio:webhook:{client_ip}", limit=limit, window_seconds=window
+    )
+    if not allowed:
+        logger.warning(f"Twilio webhook rate-limited: ip={client_ip}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # FINDING-003: verify this request actually came from Twilio before
+    # doing anything else — agent lookup, To-number routing and TwiML
+    # generation are all gated on a valid signature.
     try:
         form = await request.form()
-        called_number = form.get("To")
     except Exception:
-        called_number = None
+        form = {}
+
+    if not _validate_twilio_signature(request, form):
+        logger.warning(
+            f"Twilio webhook rejected for agent {agent_id}: missing/invalid "
+            "X-Twilio-Signature"
+        )
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    # Twilio posts the called number as the ``To`` form field. We use this
+    # to route to the right agent when several share the same webhook URL.
+    called_number = form.get("To")
 
     async with async_session_factory() as db:
         agent = await _resolve_twilio_agent(db, agent_id, called_number)
@@ -141,10 +255,16 @@ async def twilio_voice_webhook(agent_id: str, request: Request):
 
     # Build the WebSocket URL using the resolved agent's id (which may
     # differ from the path's agent_id if To-number routing matched).
+    # FINDING-003: built from the trusted, operator-configured DOMAIN
+    # setting — never from the inbound (forgeable) Host header.
     resolved_agent_id = str(agent.id)
-    host = request.headers.get("host", "localhost")
-    scheme = "wss" if request.url.scheme == "https" else "ws"
-    ws_url = f"{scheme}://{host}/ws/twilio/{resolved_agent_id}"
+    ws_scheme = "ws" if settings.domain in _LOCAL_HOSTS else "wss"
+    ws_url = f"{ws_scheme}://{settings.domain}/ws/twilio/{resolved_agent_id}"
+
+    # Short-lived, single-purpose ticket the media-stream WebSocket must
+    # present in its "start" event before we create a Session or boot a
+    # pipeline for it.
+    ticket = _create_stream_ticket(resolved_agent_id)
 
     logger.info(
         f"Twilio voice webhook: path_agent={agent_id}, resolved_agent={resolved_agent_id}, "
@@ -157,6 +277,7 @@ async def twilio_voice_webhook(agent_id: str, request: Request):
   <Connect>
     <Stream url="{ws_url}">
       <Parameter name="agent_id" value="{resolved_agent_id}" />
+      <Parameter name="ticket" value="{ticket}" />
     </Stream>
   </Connect>
 </Response>"""
@@ -177,6 +298,20 @@ async def twilio_media_stream(websocket: WebSocket, agent_id: str):
       4. We send "media" events back with base64 μ-law audio
       5. Twilio sends a "stop" event when the call ends
     """
+    # FINDING-005 (Revision 2): per-source connection cap, checked BEFORE
+    # accept() so an excess connection from a given IP never holds a slot
+    # at all (closing pre-accept sends a plain "websocket.close" ASGI
+    # message rather than completing the handshake).
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    limit, window = _WS_RATE_LIMIT
+    allowed, retry_after = await check_fixed_window(
+        f"twilio:ws:{client_ip}", limit=limit, window_seconds=window
+    )
+    if not allowed:
+        logger.warning(f"Twilio media-stream WebSocket rate-limited: ip={client_ip}")
+        await websocket.close(code=1013, reason="Too many requests")
+        return
+
     await websocket.accept()
 
     # ── 1. Wait for Twilio's initial handshake events ─────────────
@@ -219,6 +354,20 @@ async def twilio_media_stream(websocket: WebSocket, agent_id: str):
     if not stream_sid:
         logger.error("Twilio WebSocket: no stream_sid received")
         await websocket.close()
+        return
+
+    # ── 1b. Verify the stream ticket (FINDING-003) ─────────────────
+    # Minted by the signature-verified voice webhook. Checked before any
+    # Session row is created or pipeline is booted, so an arbitrary
+    # WebSocket client that merely emits a Twilio-shaped "start" frame can
+    # no longer create fabricated sessions or spend provider API credits.
+    ticket = custom_params.get("ticket") if isinstance(custom_params, dict) else None
+    if not _verify_stream_ticket(ticket, agent_id):
+        logger.warning(
+            f"Twilio WebSocket rejected for agent {agent_id}: missing/invalid/"
+            "expired stream ticket"
+        )
+        await websocket.close(code=4401)
         return
 
     # ── 2. Resolve agent ──────────────────────────────────────────

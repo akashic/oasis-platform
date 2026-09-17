@@ -41,6 +41,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 
 from app.config import settings
+from app.egress_guard import validate_egress_url
 from app.providers.catalog import resolve_llm_api_kind
 from app.database import async_session_factory
 from app.pipeline.transcript_logger import (
@@ -690,6 +691,9 @@ async def _build_llm(llm_model: str):
                 "(e.g. http://my-litellm:4000/v1) for your custom OpenAI-"
                 "compatible endpoint, or pick a built-in provider."
             )
+        # FINDING-007: resolve-time re-check (defeats DNS rebinding) right
+        # before the live interview pipeline is built for every session.
+        validate_egress_url(base_url, field="openai_compatible_llm_url")
         api_key = await _get_key("openai_compatible_llm_api_key") or "not-needed"
         return OpenAILLMService(
             api_key=api_key,
@@ -1410,6 +1414,8 @@ async def _build_stt(provider: str, language: str, model: Optional[str] = None):
                 "SELF_HOSTED_STT_URL is not set. Provide the base URL for your "
                 "OpenAI-compatible STT server (e.g. http://my-server:8000/v1)."
             )
+        # FINDING-007: resolve-time re-check (defeats DNS rebinding).
+        validate_egress_url(base_url, field="self_hosted_stt_url")
         api_key = await _get_key("self_hosted_stt_api_key") or "not-needed"
         # Per-agent model wins over global default
         effective_model = model or settings.self_hosted_stt_model or "whisper-1"
@@ -1486,6 +1492,8 @@ async def _build_tts(
                 "SELF_HOSTED_TTS_URL is not set. Provide the base URL for your "
                 "OpenAI-compatible TTS server (e.g. http://my-server:8100/v1)."
             )
+        # FINDING-007: resolve-time re-check (defeats DNS rebinding).
+        validate_egress_url(base_url, field="self_hosted_tts_url")
         api_key = await _get_key("self_hosted_tts_api_key") or "not-needed"
         # Per-agent model wins over global default
         effective_model = model or settings.self_hosted_tts_model or "tts-1"

@@ -174,3 +174,225 @@ class TestAudioStorageSettingsAPI:
         assert row["sensitive"] is True
         assert "••••" in row["display_value"]
         assert "supersecret" not in row["display_value"]
+
+    async def test_sensitive_field_stored_encrypted_in_redis(
+        self, client: AsyncClient, fake_redis
+    ):
+        """FINDING-006: S3 credentials must not be stored in plaintext.
+
+        test_REQ_SEC_FINDING_006_audio_storage_secret_encrypted
+        """
+        await client.put(
+            "/api/settings/audio-storage",
+            json={"audio_s3_secret_access_key": "supersecretkey123456"},
+        )
+        raw = await fake_redis.hget(
+            "oasis:settings:audio_storage", "audio_s3_secret_access_key"
+        )
+        assert raw is not None
+        assert "supersecretkey123456" not in raw
+
+    async def test_get_effective_audio_setting_decrypts(self, client: AsyncClient):
+        from app.api.settings import get_effective_audio_setting
+
+        await client.put(
+            "/api/settings/audio-storage",
+            json={"audio_s3_secret_access_key": "supersecretkey123456"},
+        )
+        assert (
+            await get_effective_audio_setting("audio_s3_secret_access_key")
+            == "supersecretkey123456"
+        )
+
+
+class TestAudioS3EndpointUrlValidation:
+    """FINDING-007 (Revision 4 residual): audio_s3_endpoint_url receives
+    every recorded participant audio file plus the S3 credentials, but was
+    previously unvalidated and unconfirmed, unlike the five provider URL
+    fields on PUT /api/settings/keys."""
+
+    async def test_ssrf_url_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_audio_s3_endpoint_ssrf_rejected"""
+        resp = await client.put(
+            "/api/settings/audio-storage",
+            json={
+                "audio_s3_endpoint_url": "http://169.254.169.254/latest/meta-data/",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 400
+
+    async def test_sibling_container_url_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_audio_s3_endpoint_sibling_rejected"""
+        resp = await client.put(
+            "/api/settings/audio-storage",
+            json={
+                "audio_s3_endpoint_url": "http://redis:6379",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 400
+
+    async def test_changing_url_without_confirm_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_audio_s3_endpoint_confirm_required"""
+        resp = await client.put(
+            "/api/settings/audio-storage",
+            json={"audio_s3_endpoint_url": "https://example.com:9000"},
+        )
+        assert resp.status_code == 400
+        assert "confirm_endpoint_change" in resp.json()["detail"]
+
+    async def test_changing_url_with_confirm_succeeds(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_audio_s3_endpoint_confirm_allows_change"""
+        resp = await client.put(
+            "/api/settings/audio-storage",
+            json={
+                "audio_s3_endpoint_url": "https://example.com:9000",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 200
+        row = next(
+            s for s in resp.json()["settings"] if s["field"] == "audio_s3_endpoint_url"
+        )
+        assert row["is_set"] is True
+
+    async def test_clearing_url_does_not_require_confirm(self, client: AsyncClient):
+        await client.put(
+            "/api/settings/audio-storage",
+            json={
+                "audio_s3_endpoint_url": "https://example.com:9000",
+                "confirm_endpoint_change": True,
+            },
+        )
+        resp = await client.put(
+            "/api/settings/audio-storage",
+            json={"audio_s3_endpoint_url": ""},
+        )
+        assert resp.status_code == 200
+
+
+class TestApiKeyEncryption:
+    """FINDING-006: provider credential overrides must be encrypted at rest
+    in Redis, not stored in plaintext."""
+
+    async def test_api_key_stored_encrypted_in_redis(
+        self, client: AsyncClient, fake_redis
+    ):
+        """test_REQ_SEC_FINDING_006_api_key_encrypted_in_redis"""
+        await client.put(
+            "/api/settings/keys",
+            json={"openai_api_key": "sk-plaintext-should-not-appear-1234"},
+        )
+        raw = await fake_redis.hget("oasis:settings:api_keys", "openai_api_key")
+        assert raw is not None
+        assert "sk-plaintext-should-not-appear-1234" not in raw
+
+    async def test_get_effective_key_decrypts_transparently(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_006_get_effective_key_decrypts"""
+        from app.api.settings import get_effective_key
+
+        await client.put(
+            "/api/settings/keys",
+            json={"openai_api_key": "sk-round-trip-test-key-1234"},
+        )
+        assert await get_effective_key("openai_api_key") == "sk-round-trip-test-key-1234"
+
+    async def test_legacy_plaintext_override_still_readable(
+        self, client: AsyncClient, fake_redis
+    ):
+        """Values written before FINDING-006's encryption fix must remain
+        readable (decrypt_secret falls back to returning them unchanged).
+
+        test_REQ_SEC_FINDING_006_legacy_override_readable
+        """
+        from app.api.settings import get_effective_key
+
+        await fake_redis.hset(
+            "oasis:settings:api_keys", "deepgram_api_key", "dg-legacy-plaintext-value"
+        )
+        assert await get_effective_key("deepgram_api_key") == "dg-legacy-plaintext-value"
+
+
+class TestProviderEndpointUrlValidation:
+    """FINDING-007: provider endpoint URLs are validated against SSRF and
+    require explicit confirmation to change."""
+
+    async def test_ssrf_url_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_ssrf_url_rejected_on_write"""
+        resp = await client.put(
+            "/api/settings/keys",
+            json={
+                "self_hosted_stt_url": "http://169.254.169.254/latest/meta-data/",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 400
+
+    async def test_sibling_container_url_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_sibling_container_rejected_on_write"""
+        resp = await client.put(
+            "/api/settings/keys",
+            json={
+                "self_hosted_stt_url": "http://redis:6379",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 400
+
+    async def test_changing_url_without_confirm_rejected(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_confirm_required_to_change_url"""
+        resp = await client.put(
+            "/api/settings/keys",
+            json={"self_hosted_stt_url": "https://192.168.1.5:8000/v1"},
+        )
+        assert resp.status_code == 400
+        assert "confirm_endpoint_change" in resp.json()["detail"]
+
+    async def test_changing_url_with_confirm_succeeds(self, client: AsyncClient):
+        """test_REQ_SEC_FINDING_007_confirm_allows_url_change"""
+        resp = await client.put(
+            "/api/settings/keys",
+            json={
+                "self_hosted_stt_url": "https://example.com/v1",
+                "confirm_endpoint_change": True,
+            },
+        )
+        assert resp.status_code == 200
+        keys = resp.json()["keys"]
+        row = next(k for k in keys if k["field"] == "self_hosted_stt_url")
+        assert row["is_set"] is True
+
+    async def test_clearing_url_does_not_require_confirm(self, client: AsyncClient):
+        """Clearing an override (empty string) is always allowed without
+        confirmation — only *changing to a new value* requires it."""
+        await client.put(
+            "/api/settings/keys",
+            json={
+                "self_hosted_stt_url": "https://example.com/v1",
+                "confirm_endpoint_change": True,
+            },
+        )
+        resp = await client.put(
+            "/api/settings/keys",
+            json={"self_hosted_stt_url": ""},
+        )
+        assert resp.status_code == 200
+
+    async def test_resubmitting_same_url_does_not_require_confirm(
+        self, client: AsyncClient
+    ):
+        """Re-sending the same value that's already in effect isn't a
+        change, so no confirmation is required."""
+        await client.put(
+            "/api/settings/keys",
+            json={
+                "self_hosted_stt_url": "https://example.com/v1",
+                "confirm_endpoint_change": True,
+            },
+        )
+        resp = await client.put(
+            "/api/settings/keys",
+            json={"self_hosted_stt_url": "https://example.com/v1"},
+        )
+        assert resp.status_code == 200

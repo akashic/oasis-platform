@@ -178,3 +178,80 @@ class TestKnowledgeAPI:
 
         resp = await client.delete(f"/api/studies/{study_id}/knowledge/{fake_id}")
         assert resp.status_code == 404
+
+
+# ── FINDING-009: bounded, content-type-checked file uploads ───────────────
+
+class TestKnowledgeFileUploadLimits:
+    async def test_REQ_SEC_FINDING_009_file_upload_rejects_oversized_body(
+        self, client
+    ):
+        """The body is read in bounded chunks with a running byte counter —
+        an oversized file is rejected with 413 rather than being fully
+        materialised in memory first."""
+        from app.api import knowledge as knowledge_module
+
+        resp = await client.post("/api/studies", json={"title": "Upload Test 1"})
+        study_id = resp.json()["id"]
+
+        oversized = b"x" * (knowledge_module._MAX_UPLOAD_BYTES + 1)
+        resp = await client.post(
+            f"/api/studies/{study_id}/knowledge/file",
+            files={"file": ("big.txt", oversized, "text/plain")},
+        )
+        assert resp.status_code == 413
+
+    async def test_REQ_SEC_FINDING_009_file_upload_rejects_disallowed_content_type(
+        self, client
+    ):
+        """Content type is checked against an allow-list before the body is
+        even read — the docstring's claimed .txt/.md/.csv support is now
+        enforced, not just documented."""
+        resp = await client.post("/api/studies", json={"title": "Upload Test 2"})
+        study_id = resp.json()["id"]
+
+        resp = await client.post(
+            f"/api/studies/{study_id}/knowledge/file",
+            files={"file": ("payload.exe", b"MZ\x90\x00", "application/x-msdownload")},
+        )
+        assert resp.status_code == 415
+
+    async def test_REQ_SEC_FINDING_009_file_upload_accepts_small_text_file(
+        self, client, monkeypatch
+    ):
+        """A well-formed small upload still succeeds through the new
+        content-type + streamed-size checks. `process_document` (embedding
+        generation + DB write) is mocked out here — it is exercised
+        elsewhere and the test sqlite DB's pgvector shim cannot bind a real
+        embedding list, which is unrelated to FINDING-009."""
+        import uuid as uuid_module
+        from datetime import datetime, timezone
+
+        import app.api.knowledge as knowledge_module
+
+        fake_doc = knowledge_module.KnowledgeDocumentRead(
+            id=uuid_module.uuid4(),
+            study_id=uuid_module.uuid4(),
+            title="notes.txt",
+            source_type="file",
+            content_length=len("Hello, knowledge base!"),
+            chunk_count=1,
+            created_at=datetime.now(timezone.utc),
+        )
+
+        async def _fake_process_document(**kwargs):
+            return fake_doc
+
+        monkeypatch.setattr(
+            knowledge_module, "process_document", _fake_process_document
+        )
+
+        resp = await client.post("/api/studies", json={"title": "Upload Test 3"})
+        study_id = resp.json()["id"]
+
+        resp = await client.post(
+            f"/api/studies/{study_id}/knowledge/file",
+            files={"file": ("notes.txt", b"Hello, knowledge base!", "text/plain")},
+        )
+        assert resp.status_code == 201
+        assert resp.json()["title"] == "notes.txt"

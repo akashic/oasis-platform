@@ -194,18 +194,31 @@ async def app(db_engine, fake_redis) -> FastAPI:
     import app.api.settings as _settings_module
     import app.session_manager as _sm_module
     import app.realtime as _realtime_module
+    import app.rate_limit as _rate_limit_module
+    import app.auth as _auth_module
 
     _originals = {
         "redis": _redis_module.get_redis,
         "settings": _settings_module.get_redis,
         "session_manager": _sm_module.get_redis,
         "realtime": _realtime_module.get_redis,
+        # FINDING-005: app/rate_limit.py (login lockout, Twilio webhook/WS
+        # rate limits) does `from app.redis import get_redis`, which binds
+        # its own module-level reference — patching app.redis.get_redis
+        # alone does not affect it.
+        "rate_limit": _rate_limit_module.get_redis,
+        # FINDING-008: app/auth.py (token revocation denylist, monitor
+        # ticket single-use tracking) has the same `from app.redis import
+        # get_redis` binding.
+        "auth": _auth_module.get_redis,
     }
 
     _redis_module.get_redis = _patched_get_redis
     _settings_module.get_redis = _patched_get_redis
     _sm_module.get_redis = _patched_get_redis
     _realtime_module.get_redis = _patched_get_redis
+    _rate_limit_module.get_redis = _patched_get_redis
+    _auth_module.get_redis = _patched_get_redis
 
     yield _app
 
@@ -216,6 +229,8 @@ async def app(db_engine, fake_redis) -> FastAPI:
     _settings_module.get_redis = _originals["settings"]
     _sm_module.get_redis = _originals["session_manager"]
     _realtime_module.get_redis = _originals["realtime"]
+    _rate_limit_module.get_redis = _originals["rate_limit"]
+    _auth_module.get_redis = _originals["auth"]
 
 
 @pytest_asyncio.fixture()
@@ -228,17 +243,32 @@ async def client(app: FastAPI) -> AsyncGenerator[AsyncClient, None]:
 
 @pytest_asyncio.fixture()
 async def auth_client(app: FastAPI) -> AsyncGenerator[AsyncClient, None]:
-    """An authenticated async HTTP client (gets a token first)."""
+    """An authenticated async HTTP client (gets a token first).
+
+    FINDING-001: ``/api/auth/login`` now refuses to mint tokens while
+    AUTH_ENABLED=false, so this fixture enables auth for the duration of the
+    test, logs in for a real token, then restores the previous setting.
+    """
+    from app.config import settings
+
+    original_enabled = settings.auth_enabled
+    original_password = settings.auth_password
+    settings.auth_enabled = True
+    settings.auth_password = "test-admin-password"
+
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        # Get a token (auth is disabled by default so any creds work)
-        resp = await ac.post(
-            "/api/auth/login",
-            json={"username": "admin", "password": "admin"},
-        )
-        token = resp.json()["token"]
-        ac.headers["Authorization"] = f"Bearer {token}"
-        yield ac
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/api/auth/login",
+                json={"username": settings.auth_username, "password": settings.auth_password},
+            )
+            token = resp.json()["token"]
+            ac.headers["Authorization"] = f"Bearer {token}"
+            yield ac
+    finally:
+        settings.auth_enabled = original_enabled
+        settings.auth_password = original_password
 
 
 # ---------------------------------------------------------------------------

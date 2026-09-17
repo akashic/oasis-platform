@@ -7,10 +7,13 @@ from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 
 from fastapi import Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.router import api_router
 from app.api.interviews import router as interviews_router
@@ -19,7 +22,37 @@ from app.api.monitor import router as monitor_router
 from app.api.twilio import router as twilio_router
 from app.config import settings
 from app.database import engine, get_db
+from app.middleware import MaxBodySizeMiddleware
 from app.redis import close_redis, get_redis
+
+# FINDING-009: global backstop on request body size, ahead of any
+# multipart/JSON parsing. Comfortably above legitimate payloads (knowledge
+# uploads are separately capped at 2 MiB in app/api/knowledge.py) but far
+# below "unbounded".
+MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
+def enforce_auth_posture() -> None:
+    """FINDING-001: make the auth fail-open path impossible outside development.
+
+    ``require_auth`` allows every request through when ``AUTH_ENABLED`` is
+    false. That is an accepted convenience for local development, but a
+    deploy that skips ``scripts/install.sh`` (which forces
+    ``AUTH_ENABLED=true``) must not be able to bring the whole admin API up
+    unauthenticated. Fail closed at startup instead.
+    """
+    if settings.app_env != "development" and not settings.auth_enabled:
+        raise RuntimeError(
+            "Refusing to start: AUTH_ENABLED=false is only permitted when "
+            "APP_ENV=development. Set AUTH_ENABLED=true (and AUTH_PASSWORD) "
+            "before deploying outside development."
+        )
+    logger.info(
+        "Auth posture: {}",
+        "ENABLED"
+        if settings.auth_enabled
+        else f"DISABLED (allowed — APP_ENV={settings.app_env!r})",
+    )
 
 
 @asynccontextmanager
@@ -29,6 +62,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from app.session_manager import session_cleanup_loop
 
     # ── Startup ──
+    # FINDING-001: fail closed before anything else if auth is disabled
+    # outside development.
+    enforce_auth_posture()
+
     # Verify Redis is reachable
     redis = await get_redis()
     await redis.ping()
@@ -49,6 +86,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await close_redis()
 
 
+def configure_cors(fastapi_app: FastAPI, allowed_origins: list[str]) -> None:
+    """FINDING-004: CORS is driven by an explicit allow-list, never by
+    `debug`. Starlette's CORSMiddleware reflects the request Origin whenever
+    `allow_origins=["*"]` is combined with `allow_credentials=True` — that
+    combination must never be reachable from configuration. When no origins
+    are configured, the middleware is not registered at all, so no
+    `Access-Control-Allow-*` headers are ever sent and no origin is
+    reflected. Extracted as its own function so it is unit-testable without
+    needing to reimport this module under different environment variables.
+    """
+    if allowed_origins:
+        fastapi_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+    else:
+        logger.info(
+            "CORS: no CORS_ALLOWED_ORIGINS configured — cross-origin browser "
+            "access to this API is disabled (same-origin/non-browser clients "
+            "are unaffected)."
+        )
+
+
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
@@ -57,14 +120,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS (permissive for development) ──
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if settings.debug else [],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app, settings.cors_allowed_origins)
+
+# FINDING-009: added last so it is the outermost middleware (Starlette runs
+# the most-recently-added middleware first), running ahead of CORS, routing
+# and any request-body parsing for every request.
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+
+# FINDING-015: every rate limit, lockout and audit log line
+# (app/api/auth.py, app/api/twilio.py) keyed on `request.client.host` /
+# `websocket.client.host`, which in the shipped topology is always Caddy's
+# address — every request arrives through docker/Caddyfile's `reverse_proxy
+# backend:8000`. This corrects `scope["client"]` from `X-Forwarded-For`, but
+# — critically — only when the immediate TCP peer is in
+# `settings.trusted_proxy_ips` (default: the fixed subnet docker-compose.yml
+# assigns to `oasis_net`), so a client cannot simply set the header itself
+# and evade rate limiting. Added last (outermost, alongside
+# MaxBodySizeMiddleware above) so the correction is visible to every
+# downstream middleware, dependency and route.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxy_ips)
 
 # ── API Routes ───────────────────────────────────────────────
 app.include_router(api_router)

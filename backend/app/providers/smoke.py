@@ -1,4 +1,11 @@
-"""Live checks for configured providers."""
+"""Live checks for configured providers.
+
+FINDING-007 (Revision 4 residual): every ``httpx.AsyncClient`` below is
+constructed with ``follow_redirects=False`` (httpx's own default, made
+explicit here) so a 30x response from an operator-configured self-hosted
+endpoint cannot redirect the request past the SSRF check that was just
+performed on the original URL.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,7 @@ from typing import Any
 from loguru import logger
 
 from app.config import settings
+from app.egress_guard import validate_egress_url
 from app.providers.availability import get_effective_provider_setting
 from app.providers.catalog import (
     DEFAULTS,
@@ -169,6 +177,10 @@ async def _probe_llm(model: str) -> SmokeProbeResult:
             custom_model = model.split("/", 1)[1]
             base_url = await _get_key("openai_compatible_llm_url")
             endpoint = base_url or "custom"
+            # FINDING-007: re-validate immediately before the outbound
+            # request (not only at write time in settings.py) to defeat
+            # DNS rebinding between the two checks.
+            validate_egress_url(base_url, field="openai_compatible_llm_url")
             await litellm.acompletion(
                 model=f"openai/{custom_model}",
                 messages=[{"role": "user", "content": "Reply with exactly: ok"}],
@@ -232,7 +244,7 @@ async def _probe_stt(provider: str, model: str) -> SmokeProbeResult:
             api_key = await _get_key("openai_api_key")
             base = await _openai_api_base() or "https://api.openai.com/v1"
             endpoint = f"{base}/audio/transcriptions"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -245,7 +257,7 @@ async def _probe_stt(provider: str, model: str) -> SmokeProbeResult:
 
             api_key = await _get_key("deepgram_api_key")
             endpoint = "https://api.deepgram.com/v1/listen"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     f"{endpoint}?model={model}&language=en",
                     headers={
@@ -260,7 +272,7 @@ async def _probe_stt(provider: str, model: str) -> SmokeProbeResult:
 
             api_key = await _get_key("scaleway_secret_key")
             endpoint = f"{settings.scaleway_api_url}/audio/transcriptions"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -273,11 +285,13 @@ async def _probe_stt(provider: str, model: str) -> SmokeProbeResult:
 
             base_url = await _get_key("self_hosted_stt_url")
             api_key = await _get_key("self_hosted_stt_api_key") or "not-needed"
+            # FINDING-007: resolve-time re-check (defeats DNS rebinding).
+            validate_egress_url(base_url, field="self_hosted_stt_url")
             endpoint = _openai_compatible_endpoint(
                 base_url,
                 "audio/transcriptions",
             )
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -306,7 +320,7 @@ async def _probe_tts(provider: str, model: str | None, voice: str) -> SmokeProbe
             api_key = await _get_key("openai_api_key")
             base = await _openai_api_base() or "https://api.openai.com/v1"
             endpoint = f"{base}/audio/speech"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -325,7 +339,7 @@ async def _probe_tts(provider: str, model: str | None, voice: str) -> SmokeProbe
             api_key = await _get_key("elevenlabs_api_key")
             voice_id = _resolve_elevenlabs_voice(voice)
             endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"xi-api-key": api_key, "Content-Type": "application/json"},
@@ -337,7 +351,7 @@ async def _probe_tts(provider: str, model: str | None, voice: str) -> SmokeProbe
 
             api_key = await _get_key("cartesia_api_key")
             endpoint = "https://api.cartesia.ai/tts/bytes"
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={
@@ -358,8 +372,10 @@ async def _probe_tts(provider: str, model: str | None, voice: str) -> SmokeProbe
 
             base_url = await _get_key("self_hosted_tts_url")
             api_key = await _get_key("self_hosted_tts_api_key") or "not-needed"
+            # FINDING-007: resolve-time re-check (defeats DNS rebinding).
+            validate_egress_url(base_url, field="self_hosted_tts_url")
             endpoint = _openai_compatible_endpoint(base_url, "audio/speech")
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
                 resp = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {api_key}"},

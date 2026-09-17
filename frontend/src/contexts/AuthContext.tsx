@@ -64,6 +64,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
+    // FINDING-008: revoke the token server-side (Redis-backed denylist) in
+    // addition to discarding it locally, so it cannot be replayed if it was
+    // ever captured before this point. Best-effort — if the request fails
+    // (e.g. already offline), the client-side clear still happens so the
+    // user is signed out locally either way.
+    void auth.logout().catch(() => {});
     clearAuthToken();
     setState((prev) => ({
       ...prev,

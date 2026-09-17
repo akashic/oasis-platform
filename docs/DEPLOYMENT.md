@@ -401,6 +401,23 @@ gunzip -c /opt/oasis/backups/oasis-<timestamp>.sql.gz | \
   docker compose -f /opt/oasis/docker-compose.yml exec -T postgres psql -U oasis -d oasis
 ```
 
+**Updating from a pre-FINDING-011 install (`POSTGRES_PASSWORD=change-me`).** Installs run through
+`scripts/install.sh` were never affected — it has always generated a random `POSTGRES_PASSWORD`. If
+you deployed by hand and your `.env` still has the published default, the backend now refuses to
+start at all until you set a real one. Rotate it and reindex Postgres to it in the same step:
+
+```bash
+cd /opt/oasis
+NEW_PW=$(openssl rand -hex 24)
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$NEW_PW|" .env
+docker compose exec postgres psql -U "$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)" \
+  -c "ALTER USER \"$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2-)\" WITH PASSWORD '$NEW_PW';"
+docker compose up -d
+```
+
+Also check `docker compose logs postgres` for any unexpected connections before rotating, in case the
+old default was already exploited.
+
 If you only changed a config file and do not need a rebuild:
 
 ```bash
@@ -707,14 +724,39 @@ To reboot when convenient (after a kernel update):
 
 ### Caddy and Let's Encrypt
 
-Caddy is configured via [`docker/Caddyfile`](../docker/Caddyfile). The installer patches the first line to use your domain. On first request to your domain, Caddy:
+Caddy is configured via [`docker/Caddyfile`](../docker/Caddyfile), whose site address is
+`{$DOMAIN}` — driven entirely by the `DOMAIN` variable in `.env` (FINDING-010). `docker-compose.yml`
+passes the whole `.env` file to the `caddy` service so this resolves automatically; there is no
+plaintext fallback, so Caddy refuses to start if `DOMAIN` is ever unset or empty. On first request to
+your domain, Caddy:
 
 1. Solves the Let's Encrypt HTTP-01 challenge on port 80.
 2. Receives a 90-day SSL certificate and stores it in the `caddy_data` Docker volume.
 3. Serves all subsequent requests over HTTPS, redirecting HTTP to HTTPS.
 4. Auto-renews the cert in the background (~30 days before expiry). No cron, no manual action.
 
-If you ever change your domain, edit `docker/Caddyfile`, change the first line, then `docker compose restart caddy`. Caddy will get a new cert on first request to the new domain.
+If you ever change your domain, edit `DOMAIN` in `.env`, then `docker compose restart caddy`. Caddy
+will get a new cert on first request to the new domain.
+
+#### TLS and security headers
+
+`docker/Caddyfile` sets these on every response (FINDING-010):
+
+| Header | Value |
+|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Permissions-Policy` | `microphone=(self)` |
+| `Content-Security-Policy` | Set per route — the admin dashboard and `/api/*` send `frame-ancestors 'none'`; `/interview/*` (the participant widget) does not, because it is designed to be embedded via `<iframe>` in third-party survey tools. |
+
+`DOMAIN=localhost` (the `.env.example` default) still gets TLS, issued from Caddy's own internal CA
+rather than Let's Encrypt — expect a browser certificate warning on first load; this is expected for
+local development, not a misconfiguration.
+
+For a fully plaintext local-only setup with no TLS (e.g. scripted tooling that cannot handle TLS), set
+`CADDY_CONFIG_FILE=./docker/Caddyfile.dev` in your local `.env` before `docker compose up`. This is
+never the default and must not be used on any deployment reachable from an untrusted network.
 
 ### Docker compose architecture
 
@@ -788,7 +830,7 @@ apt remove --purge fail2ban unattended-upgrades docker-ce docker-ce-cli containe
 - It does not change `sshd_config` (key-only login is already the default when you upload a key during server creation).
 - It does not set up off-site backups. Use Hetzner snapshots or set up `restic`/`borg` yourself.
 - It does not configure log shipping (Loki, Datadog, etc.). Logs live in Docker's local JSON driver.
-- It does not enable HSTS preload, CSP headers, or other web hardening beyond what Caddy does by default. Add those in the Caddyfile if you need them.
+- It does not enable HSTS *preload submission* (the `preload` directive requires submitting your domain to https://hstspreload.org yourself). `docker/Caddyfile` does set `Strict-Transport-Security`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy` and a per-route `Content-Security-Policy` by default (FINDING-010) — see [TLS and security headers](#tls-and-security-headers) below if you need to change them.
 - It does not configure outbound proxy / egress filtering. The backend can reach any IP on the internet.
 
 If you need any of the above for compliance reasons, do them after the basic install works.

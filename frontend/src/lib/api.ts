@@ -77,6 +77,11 @@ export interface LoginResponse {
   expires_in: number;
 }
 
+export interface MonitorTicketResponse {
+  ticket: string;
+  expires_in: number;
+}
+
 export const auth = {
   login: (username: string, password: string) =>
     request<LoginResponse>("/auth/login", {
@@ -85,6 +90,19 @@ export const auth = {
     }),
 
   status: () => request<AuthStatusResponse>("/auth/status"),
+
+  // FINDING-008: revoke the current token server-side (Redis-backed
+  // denylist) rather than only discarding it client-side.
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+
+  // FINDING-008: exchange the current (long-lived) admin token for a
+  // short-lived, single-use ticket to open the monitor WebSocket with,
+  // instead of putting the admin token itself in the WebSocket URL.
+  monitorTicket: (sessionId: string) =>
+    request<MonitorTicketResponse>("/auth/monitor-ticket", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId }),
+    }),
 };
 
 // ── Types ────────────────────────────────────────────────────

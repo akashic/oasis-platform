@@ -21,6 +21,27 @@ from app.knowledge.embeddings import process_document
 
 router = APIRouter(prefix="/studies/{study_id}/knowledge", tags=["knowledge"])
 
+# FINDING-009: bound file uploads in bytes (not characters) and check the
+# limit while streaming, instead of after `file.read()` had already made a
+# full, unbounded in-memory copy of the body (and `.decode()` a second one).
+# `app.middleware.MaxBodySizeMiddleware` (see app/main.py) enforces a global
+# 10 MiB ceiling on every request ahead of this — this tighter, endpoint
+# -specific cap and content-type check are defence in depth for the
+# business rule ("small text documents only"), not the sole DoS control.
+_MAX_UPLOAD_BYTES = 2 * 1024 * 1024  # 2 MiB
+_UPLOAD_CHUNK_BYTES = 64 * 1024
+_ALLOWED_UPLOAD_CONTENT_TYPES = {
+    "text/plain",
+    "text/markdown",
+    "text/x-markdown",
+    "text/csv",
+    "application/csv",
+    # Many browsers/OSes have no registered MIME type for .md/.txt and send
+    # this instead — content is still validated as UTF-8/Latin-1 text below.
+    "application/octet-stream",
+    "",
+}
+
 
 # ── Schemas ──────────────────────────────────────────────────
 
@@ -78,6 +99,14 @@ async def upload_text(
     Upload a text document to the study's knowledge base.
 
     The text is automatically chunked and embedded for RAG retrieval.
+
+    FINDING-009: unlike the multipart `/file` endpoint, FastAPI must fully
+    parse this JSON body to bind it to `KnowledgeUploadText` before this
+    function ever runs, so a byte-level streaming check cannot happen here.
+    `app.middleware.MaxBodySizeMiddleware` (see app/main.py) rejects any
+    request body over the global cap — via `Content-Length` where declared,
+    and via a running counter on the raw stream otherwise — before Starlette
+    parses it. The character cap below remains the business-rule check.
     """
     if not body.content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty.")
@@ -115,12 +144,41 @@ async def upload_file(
     Upload a text file to the study's knowledge base.
 
     Supports .txt, .md, .csv, and similar text-based formats.
+
+    FINDING-009: content type is checked against an allow-list (415 on
+    mismatch) and the body is read in bounded chunks with a running byte
+    counter, aborting with 413 as soon as it exceeds `_MAX_UPLOAD_BYTES` —
+    instead of the previous unconditional `await file.read()`, which made a
+    full in-memory copy of an attacker-controlled payload before any size
+    check ran at all.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
 
-    # Read file content
-    content_bytes = await file.read()
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if content_type not in _ALLOWED_UPLOAD_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported content type {content_type!r}. Upload a "
+                "text-based file (.txt, .md, .csv)."
+            ),
+        )
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+            )
+        chunks.append(chunk)
+    content_bytes = b"".join(chunks)
 
     # Try to decode as UTF-8
     try:

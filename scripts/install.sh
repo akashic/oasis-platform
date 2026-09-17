@@ -137,10 +137,13 @@ ok "Source ready."
 header "7/9  Configuring environment"
 
 ENV_FILE="$INSTALL_DIR/.env"
+NEW_ENV_CREATED=false
+ADMIN_PASS=""
 
 if [[ -f "$ENV_FILE" ]]; then
     log "Existing .env found. Keeping it. Edit $ENV_FILE manually if you need to change values."
 else
+    NEW_ENV_CREATED=true
     cp .env.example "$ENV_FILE"
 
     # Detect public IP (used for sslip.io fallback)
@@ -194,43 +197,79 @@ else
     # Auto-generate secrets
     SECRET_KEY=$(openssl rand -hex 32)
     POSTGRES_PASSWORD=$(openssl rand -hex 24)
+    # FINDING-006: Redis previously ran with no password at all.
+    REDIS_PASSWORD=$(openssl rand -hex 24)
 
-    # Patch .env in-place (sed expressions ordered to avoid partial-match conflicts)
+    # Patch .env in-place (sed expressions ordered to avoid partial-match
+    # conflicts). FINDING-005: AUTH_PASSWORD is intentionally NOT patched
+    # here — the admin password is stored only as an Argon2id hash
+    # (AUTH_PASSWORD_HASH, computed below), never in plaintext on disk.
     sed -i \
         -e "s|^APP_ENV=.*|APP_ENV=production|" \
         -e "s|^DEBUG=.*|DEBUG=false|" \
         -e "s|^SECRET_KEY=.*|SECRET_KEY=$SECRET_KEY|" \
         -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$POSTGRES_PASSWORD|" \
+        -e "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$REDIS_PASSWORD|" \
         -e "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=$OPENAI_KEY|" \
         -e "s|^DOMAIN=.*|DOMAIN=$DOMAIN_INPUT|" \
         -e "s|^AUTH_ENABLED=.*|AUTH_ENABLED=true|" \
         -e "s|^AUTH_USERNAME=.*|AUTH_USERNAME=admin|" \
-        -e "s|^AUTH_PASSWORD=.*|AUTH_PASSWORD=$ADMIN_PASS|" \
         "$ENV_FILE"
 
     chmod 600 "$ENV_FILE"
     ok "Created $ENV_FILE (mode 600)."
+
+    # FINDING-005: hash the admin password with Argon2id before it ever
+    # touches disk — previously AUTH_PASSWORD was written to .env in
+    # plaintext, recoverable via `cat .env`, `docker inspect`, or a backup.
+    # Argon2 isn't necessarily installed on the host, so the hash is
+    # computed inside the backend's own image instead (built now, ahead of
+    # the full `docker compose build` in step 9 — that step then reuses this
+    # build's layer cache and is effectively instant). The password is piped
+    # over stdin, never passed as a CLI argument or environment variable, so
+    # it never appears in `ps`, `docker top`, `docker inspect`, or shell
+    # history (see FINDING-018 on argv/env exposure of secrets).
+    log "Building backend image to hash the admin password (Argon2id)…"
+    docker compose build backend
+    ADMIN_PASS_HASH=$(printf '%s' "$ADMIN_PASS" | docker run --rm -i \
+        --entrypoint python oasis-backend -c '
+import sys
+from app.security import hash_password
+print(hash_password(sys.stdin.read().rstrip("\n")))
+')
+    if [[ -z "$ADMIN_PASS_HASH" ]]; then
+        fail "Failed to hash the admin password (Argon2id). Aborting before writing an insecure .env."
+    fi
+    sed -i "s|^AUTH_PASSWORD_HASH=.*|AUTH_PASSWORD_HASH=$ADMIN_PASS_HASH|" "$ENV_FILE"
+    ok "Admin password stored as an Argon2id hash (AUTH_PASSWORD_HASH) — never in plaintext."
 fi
 
 # Read the final DOMAIN value back out (whether we just wrote it or it pre-existed)
 DOMAIN_FINAL=$(grep -E '^DOMAIN=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"')
-if [[ -z "$DOMAIN_FINAL" || "$DOMAIN_FINAL" == "localhost" ]]; then
-    warn "DOMAIN in .env is empty or 'localhost'."
-    warn "Caddy will not auto-issue an SSL cert. Edit .env and set DOMAIN to a real domain."
+if [[ -z "$DOMAIN_FINAL" ]]; then
+    warn "DOMAIN in .env is empty — Caddy will refuse to start (FINDING-010:"
+    warn "it no longer has a plaintext fallback). Edit .env and set DOMAIN."
+elif [[ "$DOMAIN_FINAL" == "localhost" ]]; then
+    warn "DOMAIN in .env is 'localhost'."
+    warn "Caddy will still serve TLS-only using its own internal CA, but"
+    warn "browsers will show a certificate warning. Edit .env and set DOMAIN"
+    warn "to a real domain for a publicly-trusted Let's Encrypt certificate."
 fi
 
 # ── Step 8: Configure Caddy for the domain ───────────────────
 header "8/9  Configuring Caddy for $DOMAIN_FINAL"
-CADDYFILE="$INSTALL_DIR/docker/Caddyfile"
 
+# FINDING-010: docker/Caddyfile now reads its site address from the DOMAIN
+# environment variable directly ("{$DOMAIN} {"), and docker-compose passes
+# the whole .env file to the caddy service — no more sed-patching the
+# Caddyfile itself, and there is no plaintext fallback: Caddy refuses to
+# start if DOMAIN is ever empty.
 if [[ -n "$DOMAIN_FINAL" && "$DOMAIN_FINAL" != "localhost" ]]; then
-    # Replace the leading ":80" or any existing site address with the chosen domain.
-    # The Caddyfile on main starts with `:80 {`. For idempotency, also handle the
-    # case where the file was already edited.
-    sed -i -E "0,/^[[:space:]]*[^[:space:]{]+[[:space:]]*\{[[:space:]]*$/s//$DOMAIN_FINAL {/" "$CADDYFILE"
-    ok "Caddyfile set to listen on $DOMAIN_FINAL (auto-SSL via Let's Encrypt)."
+    ok "Caddy will listen on $DOMAIN_FINAL (auto-SSL via Let's Encrypt)."
 else
-    log "Leaving Caddyfile listening on :80 (no domain)."
+    log "DOMAIN is 'localhost' — Caddy will still serve TLS-only, using a"
+    log "certificate from its internal CA (expect a browser warning on"
+    log "first load; see docs/DEPLOYMENT.md for a plaintext dev option)."
 fi
 
 # ── Step 9: Build + start containers ─────────────────────────
@@ -260,7 +299,13 @@ else
     echo "  Open in your browser:  ${BOLD}http://<your-server-ip>${NC}"
 fi
 echo
-echo "  Login:    ${BOLD}admin${NC}  / (the AUTH_PASSWORD from .env)"
+if [[ "$NEW_ENV_CREATED" == true ]]; then
+    echo "  Login:    ${BOLD}admin${NC}  / ${BOLD}$ADMIN_PASS${NC}"
+    echo "  (FINDING-005: only an Argon2id hash of this is stored in .env —"
+    echo "  write the password down now, it cannot be recovered from disk.)"
+else
+    echo "  Login:    ${BOLD}admin${NC}  / (see AUTH_PASSWORD_HASH in .env, or your own records)"
+fi
 echo
 echo "  ${BOLD}Files & data on the server:${NC}"
 echo "    Code & config:   $INSTALL_DIR"

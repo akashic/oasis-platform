@@ -211,21 +211,28 @@ class TestBuildLLM:
         """custom/<model> routes through OpenAILLMService with the configured base URL."""
         async def _key(field):
             return {
-                "openai_compatible_llm_url": "http://litellm:4000/v1",
+                # FINDING-007: http is only allowed for private-network
+                # (RFC1918) hosts — use a private IP literal so this test
+                # doesn't depend on DNS resolution of a made-up hostname.
+                "openai_compatible_llm_url": "http://192.168.1.10:4000/v1",
                 "openai_compatible_llm_api_key": "proxy-token",
             }.get(field, "")
 
         mock_get_key.side_effect = _key
+        from app.config import settings as app_settings
         from app.pipeline.runner import _build_llm
 
-        with patch("pipecat.services.openai.llm.OpenAILLMService") as MockLLM:
-            MockLLM.return_value = MagicMock()
-            await _build_llm("custom/llama-3.3-70b")
-            MockLLM.assert_called_once()
-            call_kwargs = MockLLM.call_args.kwargs
-            assert call_kwargs["base_url"] == "http://litellm:4000/v1"
-            assert call_kwargs["api_key"] == "proxy-token"
-            assert getattr(call_kwargs["settings"], "model") == "llama-3.3-70b"
+        # FINDING-007 (Revision 4 residual): plain http to a private host now
+        # requires it to be on the operator's explicit allow-list.
+        with patch.object(app_settings, "egress_allowed_private_hosts", "192.168.1.10"):
+            with patch("pipecat.services.openai.llm.OpenAILLMService") as MockLLM:
+                MockLLM.return_value = MagicMock()
+                await _build_llm("custom/llama-3.3-70b")
+                MockLLM.assert_called_once()
+                call_kwargs = MockLLM.call_args.kwargs
+                assert call_kwargs["base_url"] == "http://192.168.1.10:4000/v1"
+                assert call_kwargs["api_key"] == "proxy-token"
+                assert getattr(call_kwargs["settings"], "model") == "llama-3.3-70b"
 
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)
     async def test_build_custom_llm_no_url_raises(self, mock_get_key):
@@ -242,15 +249,17 @@ class TestBuildLLM:
     async def test_build_custom_llm_falls_back_to_dummy_key(self, mock_get_key):
         """If no API key is set the proxy still gets a placeholder string."""
         async def _key(field):
-            return {"openai_compatible_llm_url": "http://vllm:8000/v1"}.get(field, "")
+            return {"openai_compatible_llm_url": "http://192.168.1.20:8000/v1"}.get(field, "")
 
         mock_get_key.side_effect = _key
+        from app.config import settings as app_settings
         from app.pipeline.runner import _build_llm
 
-        with patch("pipecat.services.openai.llm.OpenAILLMService") as MockLLM:
-            MockLLM.return_value = MagicMock()
-            await _build_llm("custom/qwen3-32b")
-            assert MockLLM.call_args.kwargs["api_key"] == "not-needed"
+        with patch.object(app_settings, "egress_allowed_private_hosts", "192.168.1.20"):
+            with patch("pipecat.services.openai.llm.OpenAILLMService") as MockLLM:
+                MockLLM.return_value = MagicMock()
+                await _build_llm("custom/qwen3-32b")
+                assert MockLLM.call_args.kwargs["api_key"] == "not-needed"
 
     @patch("app.pipeline.runner._openai_use_eu", new_callable=AsyncMock)
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)
@@ -320,19 +329,23 @@ class TestBuildSTT:
 
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)
     async def test_build_self_hosted_stt(self, mock_get_key):
-        mock_get_key.side_effect = ["http://stt.local/v1", "local-key"]
+        # FINDING-007: http is only allowed for private-network (RFC1918)
+        # hosts — use a private IP literal (no DNS dependency in tests).
+        mock_get_key.side_effect = ["http://192.168.1.30:9000/v1", "local-key"]
+        from app.config import settings as app_settings
         from app.pipeline.runner import _build_stt
         import importlib
 
         mod = importlib.import_module("pipecat.services.openai.stt")
-        with patch.object(mod, "OpenAISTTService") as MockSTT:
-            MockSTT.return_value = MagicMock()
-            await _build_stt("self_hosted", "en", "local-whisper")
+        with patch.object(app_settings, "egress_allowed_private_hosts", "192.168.1.30"):
+            with patch.object(mod, "OpenAISTTService") as MockSTT:
+                MockSTT.return_value = MagicMock()
+                await _build_stt("self_hosted", "en", "local-whisper")
 
-            kwargs = MockSTT.call_args.kwargs
-            assert kwargs["base_url"] == "http://stt.local/v1"
-            assert kwargs["api_key"] == "local-key"
-            assert kwargs["settings"].model == "local-whisper"
+                kwargs = MockSTT.call_args.kwargs
+                assert kwargs["base_url"] == "http://192.168.1.30:9000/v1"
+                assert kwargs["api_key"] == "local-key"
+                assert kwargs["settings"].model == "local-whisper"
 
     @patch("app.pipeline.runner._openai_realtime_base_url", new_callable=AsyncMock)
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)
@@ -422,25 +435,29 @@ class TestBuildTTS:
 
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)
     async def test_build_self_hosted_tts(self, mock_get_key):
-        mock_get_key.side_effect = ["http://tts.local/v1", "local-key"]
+        # FINDING-007: http is only allowed for private-network (RFC1918)
+        # hosts — use a private IP literal (no DNS dependency in tests).
+        mock_get_key.side_effect = ["http://192.168.1.40:9100/v1", "local-key"]
+        from app.config import settings as app_settings
         from app.pipeline.runner import _build_tts
         import importlib
 
         mod = importlib.import_module("pipecat.services.openai.tts")
-        with patch.object(mod, "OpenAITTSService") as MockTTS:
-            MockTTS.return_value = MagicMock()
-            await _build_tts(
-                "self_hosted",
-                "local-voice",
-                "en",
-                "local-tts",
-            )
+        with patch.object(app_settings, "egress_allowed_private_hosts", "192.168.1.40"):
+            with patch.object(mod, "OpenAITTSService") as MockTTS:
+                MockTTS.return_value = MagicMock()
+                await _build_tts(
+                    "self_hosted",
+                    "local-voice",
+                    "en",
+                    "local-tts",
+                )
 
-            kwargs = MockTTS.call_args.kwargs
-            assert kwargs["base_url"] == "http://tts.local/v1"
-            assert kwargs["api_key"] == "local-key"
-            assert kwargs["settings"].model == "local-tts"
-            assert kwargs["settings"].voice == "local-voice"
+                kwargs = MockTTS.call_args.kwargs
+                assert kwargs["base_url"] == "http://192.168.1.40:9100/v1"
+                assert kwargs["api_key"] == "local-key"
+                assert kwargs["settings"].model == "local-tts"
+                assert kwargs["settings"].voice == "local-voice"
 
     @patch("app.pipeline.runner._openai_use_eu", new_callable=AsyncMock)
     @patch("app.pipeline.runner._get_key", new_callable=AsyncMock)

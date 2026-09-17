@@ -1,8 +1,18 @@
 # ── Web Framework ──
-fastapi==0.115.6
+# FINDING-021: bumped to clear PYSEC-2026-1941/1942 (starlette multipart
+# rollover blocking + quadratic Range-header parsing) and PYSEC-2026-3037/
+# 3038 (python-multipart querystring/preamble DoS). starlette is now pinned
+# explicitly (previously resolved transitively through fastapi, so the
+# effective version was invisible on the lock surface) at the lowest patched
+# release compatible with fastapi==0.128.0's `starlette<0.51.0,>=0.40.0`
+# constraint and with pipecat-ai's `fastapi<1,>=0.115.6` constraint. Verified
+# against pipecat-ai[silero,websocket,google,anthropic]==1.4.0 with `pip
+# check` (clean) and the full backend test suite (513 passed).
+fastapi==0.128.0
+starlette==0.50.0
 uvicorn[standard]==0.34.0
 websockets==14.1
-python-multipart==0.0.20
+python-multipart==0.0.32
 
 # ── Database ──
 sqlalchemy[asyncio]==2.0.36
@@ -30,6 +40,10 @@ twilio>=9.0.0
 
 # ── Authentication ──
 PyJWT>=2.8.0
+# FINDING-005: Argon2id hashing for the admin password (AUTH_PASSWORD_HASH).
+argon2-cffi==25.1.0
+# FINDING-006: envelope encryption for provider credentials stored in Redis.
+cryptography==50.0.1
 
 # ── Audio recording storage (optional S3 backend) ──
 boto3>=1.35.0

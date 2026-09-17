@@ -5,8 +5,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import {
+  auth,
   sessions,
-  getAuthToken,
   type SessionDetail,
   type SessionAudioManifest,
   type EngagementSummary,
@@ -161,57 +161,74 @@ export default function SessionDetailPage() {
   useEffect(() => {
     if (!isLive || !sessionId) return;
 
-    // Attach JWT as a query param when present — the monitor endpoint reads
-    // ?token=… and rejects with close code 4401 when AUTH_ENABLED=true.
-    const token = getAuthToken();
-    const url = token
-      ? `${WS_MONITOR_URL}/${sessionId}?token=${encodeURIComponent(token)}`
-      : `${WS_MONITOR_URL}/${sessionId}`;
-    const socket = new WebSocket(url);
-    ws.current = socket;
+    let cancelled = false;
+    let socket: WebSocket | null = null;
 
-    socket.onopen = () => setLiveStatus("connected");
-
-    socket.onmessage = (event) => {
+    // FINDING-008: exchange the admin token for a short-lived (60s),
+    // single-use ticket via an authenticated REST call, instead of putting
+    // the long-lived admin token itself in the WebSocket URL — query
+    // strings are the single most commonly logged/cached/forwarded field in
+    // any proxy, CDN, WAF or browser history.
+    async function connect() {
+      let url = `${WS_MONITOR_URL}/${sessionId}`;
       try {
-        const data = JSON.parse(event.data);
-
-        if (data.type === "transcript") {
-          setLiveEntries((prev) => {
-            if (prev.some((e) => e.sequence === data.sequence)) return prev;
-            return [
-              ...prev,
-              {
-                role: data.role,
-                content: data.content,
-                sequence: data.sequence,
-                spoken_at: data.spoken_at,
-              },
-            ];
-          });
-        } else if (data.type === "session_ended") {
-          setIsLive(false);
-          setLiveStatus("ended");
-          if (studyId && agentId && sessionId) {
-            sessions.get(studyId, agentId, sessionId).then(setSession);
-          }
-        }
-      } catch (e) {
-        console.error("Failed to parse monitor message:", e);
+        const { ticket } = await auth.monitorTicket(sessionId as string);
+        url += `?ticket=${encodeURIComponent(ticket)}`;
+      } catch {
+        // No valid admin session available — connect without a ticket and
+        // let the server reject with close code 4401 if one is required.
       }
-    };
+      if (cancelled) return;
 
-    socket.onclose = () => {
-      setLiveStatus((s) => (s === "ended" ? s : "disconnected"));
-      setIsLive(false);
-    };
-    socket.onerror = () => {
-      setLiveStatus("error");
-      setIsLive(false);
-    };
+      socket = new WebSocket(url);
+      ws.current = socket;
+
+      socket.onopen = () => setLiveStatus("connected");
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          if (data.type === "transcript") {
+            setLiveEntries((prev) => {
+              if (prev.some((e) => e.sequence === data.sequence)) return prev;
+              return [
+                ...prev,
+                {
+                  role: data.role,
+                  content: data.content,
+                  sequence: data.sequence,
+                  spoken_at: data.spoken_at,
+                },
+              ];
+            });
+          } else if (data.type === "session_ended") {
+            setIsLive(false);
+            setLiveStatus("ended");
+            if (studyId && agentId && sessionId) {
+              sessions.get(studyId, agentId, sessionId).then(setSession);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to parse monitor message:", e);
+        }
+      };
+
+      socket.onclose = () => {
+        setLiveStatus((s) => (s === "ended" ? s : "disconnected"));
+        setIsLive(false);
+      };
+      socket.onerror = () => {
+        setLiveStatus("error");
+        setIsLive(false);
+      };
+    }
+
+    connect();
 
     return () => {
-      socket.close();
+      cancelled = true;
+      socket?.close();
       ws.current = null;
     };
   }, [isLive, sessionId, studyId, agentId]);

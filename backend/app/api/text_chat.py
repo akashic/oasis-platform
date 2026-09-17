@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.database import async_session_factory
+from app.egress_guard import validate_egress_url
 from app.models.agent import Agent, AgentStatus, ParticipantIdMode, ParticipantIdentifier
 from app.models.session import (
     Session,
@@ -293,6 +294,9 @@ async def _call_llm(
                 "(e.g. http://my-litellm:4000/v1) for your custom OpenAI-"
                 "compatible endpoint, or pick a built-in provider."
             )
+        # FINDING-007: resolve-time re-check (defeats DNS rebinding) right
+        # before every live chat turn, not only when the URL was written.
+        validate_egress_url(base_url, field="openai_compatible_llm_url")
         kwargs["model"] = f"openai/{custom_model}"
         kwargs["api_base"] = base_url
         kwargs["api_key"] = await _get_key("openai_compatible_llm_api_key") or "not-needed"
